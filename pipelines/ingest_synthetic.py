@@ -1,29 +1,30 @@
-import csv, math, random, time, os
+# pipelines/ingest_synthetic.py
 from datetime import datetime, timedelta, timezone
+import random, csv, os
 
-# generate 300 minutes of synthetic OHLCV around a drifting mid-price
-now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-start = now - timedelta(minutes=299)
-mid = 100.0
+OUT = "data/bars/latest.csv"
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+
+end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+start = end - timedelta(minutes=299)  # ~300 rows
+
 rows = []
-rnd = random.Random(int(now.timestamp()))  # deterministic per run window
+price = 50.0
+for i in range(300):
+    ts = start + timedelta(minutes=i)
+    # simple random walk with sane OHLC constraints
+    change = random.uniform(-0.5, 0.5)
+    open_ = price
+    high_ = max(open_, open_ + abs(change) * random.uniform(0.2, 1.2))
+    low_  = min(open_, open_ - abs(change) * random.uniform(0.2, 1.2))
+    close_= open_ + change
+    vol   = max(0.0, random.uniform(10, 2000))
+    price = close_
+    rows.append([ts.isoformat(), round(open_,4), round(high_,4), round(low_,4), round(close_,4), round(vol,4)])
 
-t = start
-while t <= now:
-    mid += rnd.uniform(-0.3, 0.3) + 0.05*math.sin(t.minute/60*2*math.pi)
-    o = mid + rnd.uniform(-0.1, 0.1)
-    h = o + abs(rnd.uniform(0.0, 0.6))
-    l = o - abs(rnd.uniform(0.0, 0.6))
-    c = o + rnd.uniform(-0.3, 0.3)
-    v = max(1, int(abs(rnd.gauss(250, 60))))
-    rows.append([t.isoformat(), round(o,6), round(h,6), round(l,6), round(c,6), v])
-    t += timedelta(minutes=1)
-
-os.makedirs("data/bars", exist_ok=True)
-out = "data/bars/latest.csv"
-with open(out, "w", newline="") as f:
+with open(OUT, "w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["ts","open","high","low","close","volume"])
     w.writerows(rows)
 
-print(f"Wrote {out} with {len(rows)} rows ending at {now.isoformat()}")
+print(f"Wrote {OUT} with {len(rows)} rows ending at {rows[-1][0]}")
