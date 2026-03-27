@@ -23,14 +23,10 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
         shell: bash
 
-      - name: Authenticate CLI
-        env:
-          HOST: ${{ secrets.DATABRICKS_HOST }}
-          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-        run: |
-          databricks auth login --host "$HOST" --token "$TOKEN"
-
       - name: Upload CSV to DBFS (overwrite same path)
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
           databricks fs cp --overwrite data/bars/latest.csv dbfs:/FileStore/qf/latest.csv
 
@@ -43,10 +39,9 @@ jobs:
           set -euo pipefail
 
           read -r -d '' SQL <<'EOSQL'
-          -- (optional) pick an explicit catalog to avoid ambiguity
+          -- optional: pin catalog so schema lands where you expect
           -- USE CATALOG main;
 
-          -- 1) Ensure schema & table exist
           CREATE SCHEMA IF NOT EXISTS quant_finance;
 
           CREATE TABLE IF NOT EXISTS quant_finance.bars_1m (
@@ -60,27 +55,22 @@ jobs:
           )
           USING DELTA;
 
-          -- 2) Re-load the same file each run
           COPY INTO quant_finance.bars_1m
           FROM 'dbfs:/FileStore/qf/latest.csv'
           FILEFORMAT = CSV
           FORMAT_OPTIONS ('header'='true')
           COPY_OPTIONS ('force'='true');
 
-          -- 3) Tag newly ingested rows
           UPDATE quant_finance.bars_1m
           SET ingest_run_ts = current_timestamp()
           WHERE ingest_run_ts IS NULL;
 
-          -- 4a) Active view (flags rows from the latest batch)
           CREATE OR REPLACE VIEW quant_finance.bars_1m_active AS
-          SELECT
-            t.*,
-            CASE WHEN t.ingest_run_ts = (SELECT max(ingest_run_ts) FROM quant_finance.bars_1m)
-                 THEN true ELSE false END AS is_active
+          SELECT t.*,
+                 CASE WHEN t.ingest_run_ts = (SELECT max(ingest_run_ts) FROM quant_finance.bars_1m)
+                      THEN true ELSE false END AS is_active
           FROM quant_finance.bars_1m t;
 
-          -- 4b) Silver view (dedupe per ts by newest batch)
           CREATE OR REPLACE VIEW quant_finance.bars_1m_silver AS
           WITH ranked AS (
             SELECT *, row_number() OVER (PARTITION BY ts ORDER BY ingest_run_ts DESC) rn
@@ -90,7 +80,7 @@ jobs:
           FROM ranked WHERE rn = 1;
           EOSQL
 
-          # Submit statement to the SQL warehouse
+          # Submit SQL to the Statement Execution API 2.0
           submit=$(jq -n --arg sql "$SQL" --arg wid "$WAREHOUSE_ID" \
             '{statement:$sql, warehouse_id:$wid}' |
             curl -sS -X POST "$HOST/api/2.0/sql/statements" \
@@ -101,7 +91,7 @@ jobs:
           echo "$submit" | tee submit.json
           stmt_id=$(jq -r '.statement_id' <<<"$submit")
 
-          # Poll for completion
+          # Poll until done
           for i in $(seq 1 60); do
             status=$(curl -sS -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
               -H "Authorization: Bearer $TOKEN")
