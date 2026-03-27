@@ -1,10 +1,19 @@
 import sys
 import pandas as pd
 import great_expectations as gx
-import great_expectations.expectations as gxe  # Expectation classes
+from great_expectations.expectations.core import (
+    ExpectTableRowCountToBeBetween,
+    ExpectColumnValuesToNotBeNull,
+    ExpectColumnValuesToBeBetween,
+    ExpectColumnPairValuesAToBeGreaterThanB,
+)
 
 CSV = "data/bars/latest.csv"
 df = pd.read_csv(CSV, parse_dates=["ts"])
+
+# Ensure numerics are truly numeric (prevents false failures):
+for c in ["open", "high", "low", "close", "volume"]:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
 
 # 1) Ephemeral context (in‑memory)
 ctx = gx.get_context(mode="ephemeral")
@@ -18,48 +27,51 @@ batch = bd.get_batch(batch_parameters={"dataframe": df})
 # 3) Build an ExpectationSuite and add expectations
 suite = gx.ExpectationSuite(name="bars_suite")
 
+# Row count — your synthetic generator writes ~300 rows
 suite.add_expectation(
-    gxe.ExpectTableRowCountToBeBetween(min_value=100, max_value=100_000)
+    expectation=ExpectTableRowCountToBeBetween(min_value=100, max_value=100_000)
 )
 
+# Not‑nulls
 for col in ["ts", "open", "high", "low", "close", "volume"]:
-    suite.add_expectation(gxe.ExpectColumnValuesToNotBeNull(column=col))
+    suite.add_expectation(expectation=ExpectColumnValuesToNotBeNull(column=col))
 
+# Reasonable numeric ranges
 for col in ["open", "high", "low", "close"]:
     suite.add_expectation(
-        gxe.ExpectColumnValuesToBeBetween(column=col, min_value=0, max_value=10_000_000)
+        expectation=ExpectColumnValuesToBeBetween(column=col, min_value=0, max_value=10_000_000)
     )
-
 suite.add_expectation(
-    gxe.ExpectColumnValuesToBeBetween(column="volume", min_value=0)
+    expectation=ExpectColumnValuesToBeBetween(column="volume", min_value=0)
 )
 
-# OHLC relationship: high >= low
-# Use the 'greater than B' class with or_equal=True (that's the supported API)
+# OHLC relationships
+# high >= low
 suite.add_expectation(
-    gxe.ExpectColumnPairValuesAToBeGreaterThanB(
-        column_A="high",
-        column_B="low",
-        or_equal=True
+    expectation=ExpectColumnPairValuesAToBeGreaterThanB(
+        column_A="high", column_B="low", or_equal=True
     )
 )
-
-# (Optional) also ensure 'open'/'close' lie within [low, high]
+# open, close must lie within [low, high]
 for col in ["open", "close"]:
     suite.add_expectation(
-        gxe.ExpectColumnPairValuesAToBeGreaterThanB(column_A=col, column_B="low", or_equal=True)
+        expectation=ExpectColumnPairValuesAToBeGreaterThanB(
+            column_A=col, column_B="low", or_equal=True
+        )
     )
-    # "less than or equal to" doesn't have a separate class; invert the comparison
-    # i.e., expect high >= col  <=>  expect col <= high
     suite.add_expectation(
-        gxe.ExpectColumnPairValuesAToBeGreaterThanB(column_A="high", column_B=col, or_equal=True)
+        expectation=ExpectColumnPairValuesAToBeGreaterThanB(
+            column_A="high", column_B=col, or_equal=True
+        )
     )
 
+# Register suite and validate
 ctx.suites.add(suite)
 
-# 4) Validate
-result = batch.validate(suite)
+result = batch.validate(expectation_suite=suite)
+
+# Pretty-print minimal summary; you can also do result.to_json_dict()
 print(result)
+
 if not result.success:
     sys.exit("GX validation failed; aborting commit.")
-``
