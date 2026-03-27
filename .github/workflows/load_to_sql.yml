@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+# Optional: silence Node 20 deprecation warnings now.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   load-to-sql:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
@@ -25,7 +29,7 @@ jobs:
           databricks version
         shell: bash
 
-      # (NEW) Bootstrap the UC schema + volume BEFORE uploading
+      # Bootstrap the UC schema + volume BEFORE uploading
       - name: Bootstrap schema + volume
         env:
           HOST: ${{ secrets.DATABRICKS_HOST }}
@@ -33,23 +37,33 @@ jobs:
           WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
         run: |
           set -euo pipefail
+
+          # Pre-flight: fail early with a clear message if any secret is missing
+          : "${HOST:?Missing DATABRICKS_HOST secret}"
+          : "${TOKEN:?Missing DATABRICKS_TOKEN secret}"
+          : "${WAREHOUSE_ID:?Missing DATABRICKS_WAREHOUSE_ID secret}"
+
           read -r -d '' SQL <<'EOSQL'
           USE CATALOG main;
           CREATE SCHEMA IF NOT EXISTS quant_finance;
           CREATE VOLUME IF NOT EXISTS main.quant_finance.qf_staging;
           EOSQL
+
           submit=$(jq -n --arg sql "$SQL" --arg wid "$WAREHOUSE_ID" \
             '{statement:$sql, warehouse_id:$wid, catalog:"main"}' |
             curl -sS -X POST "$HOST/api/2.0/sql/statements" \
               -H "Authorization: Bearer '"$TOKEN"'" \
               -H "Content-Type: application/json" \
               -d @-)
-          stmt_id=$(jq -r '.statement_id' <<<"$submit")
-          [ -z "$stmt_id" ] && { echo "Failed to submit bootstrap SQL"; exit 1; }
+
+          echo "$submit" | tee submit.json
+          stmt_id=$(jq -r '.statement_id // empty' <<< "$submit")
+          [ -z "$stmt_id" ] && { echo "Failed to submit bootstrap SQL (see submit.json above)"; exit 1; }
+
           for i in $(seq 1 40); do
             status=$(curl -sS -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
               -H "Authorization: Bearer $TOKEN")
-            state=$(jq -r '.status.state' <<<"$status")
+            state=$(jq -r '.status.state' <<< "$status")
             echo "Bootstrap state: $state"
             [ "$state" = "SUCCEEDED" ] && exit 0
             [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ] && { echo "$status"; exit 1; }
@@ -63,7 +77,9 @@ jobs:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
+          # Ensure directory exists (idempotent)
           databricks fs mkdirs "dbfs:/Volumes/main/quant_finance/qf_staging" || true
+          # Upload the file
           databricks fs cp --overwrite "data/bars/latest.csv" \
             "dbfs:/Volumes/main/quant_finance/qf_staging/latest.csv"
 
@@ -74,6 +90,7 @@ jobs:
           WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
         run: |
           set -euo pipefail
+
           read -r -d '' SQL <<'EOSQL'
           USE CATALOG main;
           CREATE SCHEMA IF NOT EXISTS quant_finance;
@@ -89,22 +106,26 @@ jobs:
           )
           USING DELTA;
 
+          -- Re-ingest the same path every run
           COPY INTO quant_finance.bars_1m
           FROM 'dbfs:/Volumes/main/quant_finance/qf_staging/latest.csv'
           FILEFORMAT = CSV
           FORMAT_OPTIONS ('header'='true')
           COPY_OPTIONS ('force'='true');
 
+          -- Tag new rows from this run
           UPDATE quant_finance.bars_1m
           SET ingest_run_ts = current_timestamp()
           WHERE ingest_run_ts IS NULL;
 
+          -- “Active” view flags the newest batch
           CREATE OR REPLACE VIEW quant_finance.bars_1m_active AS
           SELECT t.*,
                  CASE WHEN t.ingest_run_ts = (SELECT max(ingest_run_ts) FROM quant_finance.bars_1m)
                       THEN true ELSE false END AS is_active
           FROM quant_finance.bars_1m t;
 
+          -- Silver view: dedupe per ts by newest batch
           CREATE OR REPLACE VIEW quant_finance.bars_1m_silver AS
           WITH ranked AS (
             SELECT *, row_number() OVER (PARTITION BY ts ORDER BY ingest_run_ts DESC) rn
@@ -120,12 +141,15 @@ jobs:
               -H "Authorization: Bearer '"$TOKEN"'" \
               -H "Content-Type: application/json" \
               -d @-)
-          stmt_id=$(jq -r '.statement_id' <<<"$submit")
-          [ -z "$stmt_id" ] && { echo "Failed to submit ingestion SQL"; exit 1; }
+
+          echo "$submit" | tee submit.json
+          stmt_id=$(jq -r '.statement_id // empty' <<< "$submit")
+          [ -z "$stmt_id" ] && { echo "Failed to submit ingestion SQL (see submit.json above)"; exit 1; }
+
           for i in $(seq 1 60); do
             status=$(curl -sS -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
               -H "Authorization: Bearer $TOKEN")
-            state=$(jq -r '.status.state' <<<"$status")
+            state=$(jq -r '.status.state' <<< "$status")
             echo "State: $state"
             if [ "$state" = "SUCCEEDED" ]; then
               echo "$status" | tee final.json
@@ -137,5 +161,6 @@ jobs:
             fi
             sleep 3
           done
+
           echo "Timed out waiting for SQL to finish."
           exit 1
