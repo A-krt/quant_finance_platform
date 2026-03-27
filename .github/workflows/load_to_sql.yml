@@ -40,6 +40,7 @@ jobs:
           WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
         run: |
           set -euo pipefail
+          HOST="${HOST%/}"  # normalize trailing slash
           payload='{"statement":"SELECT 1","warehouse_id":"'"$WAREHOUSE_ID"'","wait_timeout":"10s","on_wait_timeout":"CONTINUE"}'
           out=$(curl -sS -X POST "$HOST/api/2.0/sql/statements" \
             -H "Authorization: Bearer $TOKEN" \
@@ -110,15 +111,16 @@ jobs:
           WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
         run: |
           set -euo pipefail
+          HOST="${HOST%/}"  # normalize trailing slash
 
-          # Read the multi-statement SQL and split into individual statements
-          mapfile -t statements < <(python3 << 'PY'
+          # Read the multi-statement SQL and split into individual statements (preserve newlines)
+          mapfile -d '' -t statements < <(python3 << 'PY'
           with open("sql_to_run.sql") as f:
             content = f.read()
           # naive split by ';' - safe for our script (no semicolons inside string literals)
           stmts = [s.strip() for s in content.split(';') if s.strip()]
           for s in stmts:
-            print(s)
+            print(s, end='\0')   # NUL-delimit each statement to avoid line-splitting in bash
           PY
           )
 
@@ -136,7 +138,7 @@ jobs:
                 on_wait_timeout:"CONTINUE"}')
 
             submit=$(curl -sS -w '\n%{http_code}' -X POST "$HOST/api/2.0/sql/statements" \
-              -H "Authorization: Bearer '"$TOKEN"'" \
+              -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/json" \
               -d "$payload")
 
@@ -199,7 +201,7 @@ jobs:
             return 1
           }
 
-          # Execute each statement sequentially
+          # Execute each statement sequentially (stop on first failure due to set -e)
           for s in "${statements[@]}"; do
             echo "------ Executing SQL ------"
             echo "$s"
