@@ -20,10 +20,19 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install great-expectation
+
       - name: Generate CSV
         run: |
           python -m pip install --upgrade pip
           python pipelines/ingest_synthetic.py
+
+      - name: Validate CSV with Great Expectations
+        run: |
+          python pipelines/validate_gx.p
 
       - name: Commit CSV
         run: |
