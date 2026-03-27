@@ -17,13 +17,13 @@ jobs:
       - name: Checkout repo to get latest.csv
         uses: actions/checkout@v4
 
-      - name: Upload CSV to DBFS (overwrite)
+      - name: Upload CSV to DBFS (overwrite same path)
         env:
           HOST: ${{ secrets.DATABRICKS_HOST }}
           TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
           set -e
-          # Upload data/bars/latest.csv to dbfs:/FileStore/qf/latest.csv
+          # Upload data/bars/latest.csv to a fixed path (simple folder). We reload it on every run.
           curl -sS -X POST "$HOST/api/2.0/dbfs/put" \
             -H "Authorization: Bearer $TOKEN" \
             -F "path=/FileStore/qf/latest.csv" \
@@ -31,7 +31,7 @@ jobs:
             -F "contents=@data/bars/latest.csv" \
             | tee dbfs_put.json
 
-      - name: Execute SQL on Serverless Warehouse (CREATE + COPY INTO)
+      - name: Execute SQL on Serverless Warehouse (CREATE + COPY INTO + tag + views)
         env:
           HOST: ${{ secrets.DATABRICKS_HOST }}
           TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -40,23 +40,54 @@ jobs:
           set -e
 
           SQL=$(cat <<'EOSQL'
-          -- Create schema/table if not present
+          -- 1) Ensure schema & table exist (table includes the tagging column)
           CREATE SCHEMA IF NOT EXISTS quant_finance;
+
           CREATE TABLE IF NOT EXISTS quant_finance.bars_1m (
             ts TIMESTAMP,
             open DOUBLE,
             high DOUBLE,
             low  DOUBLE,
             close DOUBLE,
-            volume DOUBLE
+            volume DOUBLE,
+            ingest_run_ts TIMESTAMP
           )
           USING DELTA;
 
-          -- Load the freshly uploaded CSV into the Delta table
+          -- 2) Reload the single file *every run* (override default idempotency)
+          --    COPY INTO normally *skips* previously ingested paths even if modified;
+          --    'force=true' tells it to re-process the same path cleanly.
           COPY INTO quant_finance.bars_1m
           FROM 'dbfs:/FileStore/qf/latest.csv'
           FILEFORMAT = CSV
-          FORMAT_OPTIONS ('header'='true');
+          FORMAT_OPTIONS ('header'='true')
+          COPY_OPTIONS ('force'='true');
+
+          -- 3) Tag only the newly appended rows (existing rows retain their tag)
+          UPDATE quant_finance.bars_1m
+          SET ingest_run_ts = current_timestamp()
+          WHERE ingest_run_ts IS NULL;
+
+          -- 4a) “Active” view: exposes a simple boolean flag for the latest batch
+          CREATE OR REPLACE VIEW quant_finance.bars_1m_active AS
+          SELECT
+            t.*,
+            CASE
+              WHEN t.ingest_run_ts = (SELECT max(ingest_run_ts) FROM quant_finance.bars_1m)
+              THEN true ELSE false
+            END AS is_active
+          FROM quant_finance.bars_1m t;
+
+          -- 4b) Silver view (optional): dedupe one row per ts, keeping newest batch
+          CREATE OR REPLACE VIEW quant_finance.bars_1m_silver AS
+          WITH ranked AS (
+            SELECT *,
+                   row_number() OVER (PARTITION BY ts ORDER BY ingest_run_ts DESC) AS rn
+            FROM quant_finance.bars_1m
+          )
+          SELECT ts, open, high, low, close, volume, ingest_run_ts
+          FROM ranked
+          WHERE rn = 1;
           EOSQL
           )
 
