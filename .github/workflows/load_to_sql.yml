@@ -1,139 +1,205 @@
-import csv, os, sys, time, json
-from textwrap import dedent
-import urllib.request
+name: Load CSV into Delta via SQL Warehouse
 
-HOST = os.environ.get("DATABRICKS_HOST")
-TOKEN = os.environ.get("DATABRICKS_TOKEN")
-WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID")
+on:
+  workflow_run:
+    workflows: ["Ingest Synthetic Bars"]    # run after your ingest finishes
+    types: [completed]
+  workflow_dispatch:                         # or run manually
 
-if not (HOST and TOKEN and WAREHOUSE_ID):
-    sys.exit("Set DATABRICKS_HOST, DATABRICKS_TOKEN, DATABRICKS_WAREHOUSE_ID env vars")
+permissions:
+  contents: read
 
-API = f"{HOST.rstrip('/')}/api/2.0/sql/statements"
+env:
+  # Optional: silence the Node 20 deprecation warning on runners
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-def post_stmt(sql: str) -> str:
-    """POST one SQL statement, return statement_id or 'SUCCEEDED'."""
-    payload = {"statement": sql, "warehouse_id": WAREHOUSE_ID}
-    req = urllib.request.Request(API, data=json.dumps(payload).encode("utf-8"),
-                                 headers={"Authorization": f"Bearer {TOKEN}",
-                                          "Content-Type": "application/json"})
-    with urllib.request.urlopen(req) as resp:
-        body = json.loads(resp.read().decode())
-    state = body.get("status", {}).get("state")
-    if state == "SUCCEEDED":
-        return "SUCCEEDED"
-    stmt_id = body.get("statement_id")
-    if not stmt_id:
-        print("Submit failed; full body:", json.dumps(body, indent=2))
-        sys.exit(1)
-    return stmt_id
+jobs:
+  load-to-sql:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
 
-def poll_stmt(stmt_id: str, timeout_sec=900):
-    """Poll until SUCCEEDED/FAILED/CANCELED or timeout."""
-    url = f"{API}/{stmt_id}"
-    start = time.time()
-    while True:
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
-        with urllib.request.urlopen(req) as resp:
-            body = json.loads(resp.read().decode())
-        state = body.get("status", {}).get("state")
-        if state in {"SUCCEEDED", "FAILED", "CANCELED"}:
-            if state == "SUCCEEDED":
-                return
-            print(json.dumps(body, indent=2))
-            sys.exit(f"Statement {state}")
-        if time.time() - start > timeout_sec:
-            sys.exit("Timed out waiting for SQL to finish")
-        time.sleep(2)
+    steps:
+      - name: Checkout repo (get latest.csv)
+        uses: actions/checkout@v4
 
-def run(sql: str):
-    sid = post_stmt(sql)
-    if sid != "SUCCEEDED":
-        poll_stmt(sid)
+      - name: Set up Python (for the tiny generator)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-# ---------- build the statements ----------
+      - name: Install jq (JSON CLI)
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
 
-schema = "quant_finance"
-staging = f"{schema}.staging_bars"
-hist    = f"{schema}.hist_staging_bars"
-integr  = f"{schema}.bars_1m"  # your integration table
+      # ─────────────────────────────────────────────────────────────────────────
+      # 1) Generate SQL from CSV
+      #    - Free Edition -> Hive metastore (no catalogs/volumes)
+      #    - staging:  quant_finance.staging_bars
+      #    - history:  quant_finance.hist_staging_bars
+      #    - target :  quant_finance.bars_1m    (your integration table)
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Build sql_to_run.sql (staging → hist_staging → integration)
+        run: |
+          python - <<'PY'
+          import csv, pathlib
 
-# 1) create schema/table objects
-statements = [
-    f"CREATE SCHEMA IF NOT EXISTS {schema}",
-    dedent(f"""
-    CREATE TABLE IF NOT EXISTS {staging} (
-      ts TIMESTAMP,
-      open DOUBLE,
-      high DOUBLE,
-      low  DOUBLE,
-      close DOUBLE,
-      volume DOUBLE,
-      ingest_run_ts TIMESTAMP
-    ) USING DELTA
-    """).strip(),
-    dedent(f"""
-    CREATE TABLE IF NOT EXISTS {hist} (
-      load_ts TIMESTAMP,
-      ts TIMESTAMP,
-      open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE
-    ) USING DELTA
-    """).strip(),
-    dedent(f"""
-    CREATE TABLE IF NOT EXISTS {integr} (
-      ts TIMESTAMP,
-      open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE
-    ) USING DELTA
-    """).strip(),
-]
+          csv_path = pathlib.Path("data/bars/latest.csv")
+          out_path = pathlib.Path("sql_to_run.sql")
 
-# 2) load staging from CSV (INSERT VALUES for small files)
-values = []
-with open("data/bars/latest.csv", newline="", encoding="utf-8") as f:
-    rdr = csv.DictReader(f)
-    for r in rdr:
-        # ts like 2026-03-27T18:42:00+00:00  -> quote as TIMESTAMP literal
-        ts = r["ts"].replace("'", "''")
-        def num(x): return "NULL" if x.strip()=="" else x
-        values.append(
-            f"(TIMESTAMP '{ts}', {num(r['open'])}, {num(r['high'])}, "
-            f"{num(r['low'])}, {num(r['close'])}, {num(r['volume'])})"
-        )
+          rows = []
+          with csv_path.open(newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for z in r:
+              # Quote timestamp; keep numbers as-is; NULL for blanks
+              ts = z["ts"].replace("'", "''")
+              def num(x): return "NULL" if (x or "").strip()=="" else x
+              rows.append(
+                f"(TIMESTAMP '{ts}', {num(z['open'])}, {num(z['high'])}, "
+                f"{num(z['low'])}, {num(z['close'])}, {num(z['volume'])})"
+              )
 
-if not values:
-    print("No rows in CSV; nothing to load.")
-    sys.exit(0)
+          if not rows:
+            out_path.write_text("-- CSV is empty; nothing to do.\n", encoding="utf-8")
+            print("No rows found; wrote placeholder SQL and exiting early.")
+            raise SystemExit(0)
 
-insert_staging = (
-    f"INSERT OVERWRITE {staging} (ts, open, high, low, close, volume) VALUES\n  "
-    + ",\n  ".join(values)
-)
-statements.append(insert_staging)
+          schema = "quant_finance"
+          staging = f"{schema}.staging_bars"
+          hist    = f"{schema}.hist_staging_bars"
+          integr  = f"{schema}.bars_1m"
 
-# 3) tag staging rows with load timestamp (ingest_run_ts)
-statements.append(
-    f"UPDATE {staging} SET ingest_run_ts = current_timestamp() WHERE ingest_run_ts IS NULL"
-)
+          sql = f"""
+          -- Optional: put a ceiling on statement runtime (30 minutes)
+          SET STATEMENT_TIMEOUT = 1800;
 
-# 4) append a snapshot to hist_staging
-statements.append(
-    f"INSERT INTO {hist} SELECT current_timestamp(), ts, open, high, low, close, volume FROM {staging}"
-)
+          CREATE SCHEMA IF NOT EXISTS {schema};
 
-# 5) upsert into integration (newest wins)
-statements.append(dedent(f"""
-MERGE INTO {integr} t
-USING {staging} s
-ON t.ts = s.ts
-WHEN MATCHED THEN UPDATE SET
-  t.open=s.open, t.high=s.high, t.low=s.low, t.close=s.close, t.volume=s.volume
-WHEN NOT MATCHED THEN INSERT (ts, open, high, low, close, volume)
-VALUES (s.ts, s.open, s.high, s.low, s.close, s.volume)
-""").strip())
+          CREATE TABLE IF NOT EXISTS {staging} (
+            ts TIMESTAMP,
+            open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE,
+            ingest_run_ts TIMESTAMP
+          ) USING DELTA;
 
-# ---------- execute ----------
-for sql in statements:
-    print("\n=== Executing ===\n", sql)
-    run(sql)
+          CREATE TABLE IF NOT EXISTS {hist} (
+            load_ts TIMESTAMP,
+            ts TIMESTAMP,
+            open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE
+          ) USING DELTA;
 
-print("\nAll done.")
+          CREATE TABLE IF NOT EXISTS {integr} (
+            ts TIMESTAMP,
+            open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE
+          ) USING DELTA;
+
+          -- Replace staging with the current CSV rows
+          INSERT OVERWRITE {staging} (ts, open, high, low, close, volume) VALUES
+            {", ".join(rows)};
+
+          -- Tag the freshly loaded staging rows
+          UPDATE {staging}
+          SET ingest_run_ts = current_timestamp()
+          WHERE ingest_run_ts IS NULL;
+
+          -- Keep a history snapshot of each staging load
+          INSERT INTO {hist}
+          SELECT current_timestamp(), ts, open, high, low, close, volume
+          FROM {staging};
+
+          -- Upsert into integration (newest wins on ts)
+          MERGE INTO {integr} t
+          USING {staging} s
+          ON t.ts = s.ts
+          WHEN MATCHED THEN UPDATE SET
+            t.open=s.open, t.high=s.high, t.low=s.low, t.close=s.close, t.volume=s.volume
+          WHEN NOT MATCHED THEN INSERT (ts, open, high, low, close, volume)
+          VALUES (s.ts, s.open, s.high, s.low, s.close, s.volume);
+          """
+          out_path.write_text(sql.strip() + "\n", encoding="utf-8")
+          print("Wrote sql_to_run.sql")
+          PY
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 2) Execute each statement separately via Statement Execution API 2.0
+      #    - The API runs ONE statement per request; we split on ';'
+      #    - POST (optionally wait up to 10s) → if not finished, poll GET
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Execute SQL (Statement Execution API; one statement at a time)
+        env:
+          HOST: ${{ secrets.DATABRICKS_HOST }}
+          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        run: |
+          set -euo pipefail
+
+          # Pre-flight: make sure secrets are present
+          : "${HOST:?Missing DATABRICKS_HOST secret}"
+          : "${TOKEN:?Missing DATABRICKS_TOKEN secret}"
+          : "${WAREHOUSE_ID:?Missing DATABRICKS_WAREHOUSE_ID secret}"
+
+          # Split the SQL file on ';' (simple splitter; fine for our generator)
+          mapfile -t stmts < <(python - <<'PY'
+          with open("sql_to_run.sql","r",encoding="utf-8") as f:
+              content = f.read()
+          for s in [x.strip() for x in content.split(';') if x.strip()]:
+              print(s)
+          PY
+          )
+
+          api="$HOST/api/2.0/sql/statements"
+
+          for sql in "${stmts[@]}"; do
+            echo "────────────────────────────────────────────────────────"
+            echo "$sql"
+            echo "────────────────────────────────────────────────────────"
+
+            # POST one statement; hybrid mode:
+            #   wait_timeout=10s → short synchronous wait
+            #   on_wait_timeout=CONTINUE → fall back to async + poll
+            payload=$(jq -n --arg s "$sql" --arg wid "$WAREHOUSE_ID" \
+              '{statement:$s, warehouse_id:$wid, wait_timeout:"10s", on_wait_timeout:"CONTINUE"}')
+
+            submit=$(curl -sS -w '\n%{http_code}' -X POST "$api" \
+              -H "Authorization: Bearer '"$TOKEN"'" \
+              -H "Content-Type: application/json" \
+              -d "$payload")
+
+            body=$(printf "%s" "$submit" | sed '$d')
+            code=$(printf "%s" "$submit" | tail -n1)
+
+            if [ "$code" -ge 400 ]; then
+              echo "Submit failed (HTTP $code)"; echo "$body" | jq .
+              exit 1
+            fi
+
+            state=$(echo "$body" | jq -r '.status.state // empty')
+            if [ "$state" = "SUCCEEDED" ]; then
+              echo "✓ Finished synchronously"; continue
+            fi
+
+            stmt_id=$(echo "$body" | jq -r '.statement_id // empty')
+            if [ -z "$stmt_id" ]; then
+              echo "No statement_id and not SUCCEEDED; full payload:"; echo "$body" | jq .
+              exit 1
+            fi
+
+            # Poll up to ~20 minutes (120 * 10s) to handle cold starts/queue
+            for i in $(seq 1 120); do
+              resp=$(curl -sS -w '\n%{http_code}' -X GET "$api/$stmt_id" \
+                -H "Authorization: Bearer '"$TOKEN"'" )
+              rbody=$(printf "%s" "$resp" | sed '$d')
+              rcode=$(printf "%s" "$resp" | tail -n1)
+              st=$(echo "$rbody" | jq -r '.status.state // empty')
+              echo "Poll #$i: HTTP=$rcode state=${st:-<none>}"
+
+              if [ "$st" = "SUCCEEDED" ]; then
+                echo "✓ Statement SUCCEEDED"
+                break
+              elif [ "$st" = "FAILED" ] || [ "$st" = "CANCELED" ] || [ "$rcode" -ge 400 ]; then
+                echo "✗ Statement failed/canceled:"; echo "$rbody" | jq .
+                exit 1
+              fi
+              sleep 10
+            done
+          done
+
+          echo "All statements executed successfully."
