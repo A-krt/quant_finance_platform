@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
 import sys
+import os
 import pandas as pd
 import great_expectations as gx
-from great_expectations.expectations.core import (
-    ExpectTableRowCountToBeBetween,
-    ExpectColumnValuesToNotBeNull,
-    ExpectColumnValuesToBeBetween,
-    ExpectColumnPairValuesAToBeGreaterThanB,
-)
+import great_expectations.expectations as gxe  # Expectation classes
 
 CSV = "data/bars/latest.csv"
 
-def validate_batch(batch, suite):
+def opt_into_node24_for_github_actions() -> None:
     """
-    Be robust across GX builds where Batch.validate accepts:
-      - positional (suite) OR
-      - keyword (expectation_suite=suite)
+    Opt into Node.js 24 for JavaScript actions in GitHub Actions by writing
+    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true to the special $GITHUB_ENV file.
+    This will affect *subsequent steps* in the same job.
     """
     try:
-        # Prefer positional — your CI build rejects the keyword form
-        return batch.validate(suite)
-    except TypeError:
-        # Some builds only accept the keyword
-        return batch.validate(expectation_suite=suite)
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            env_file = os.getenv("GITHUB_ENV")
+            if env_file:
+                with open(env_file, "a", encoding="utf-8") as f:
+                    f.write("FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true\n")
+                print("[CI] Opted into Node 24: set FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true for subsequent steps.")
+            else:
+                print("[CI] GITHUB_ENV not set; cannot persist Node 24 opt-in from this step.", file=sys.stderr)
+        else:
+            # Not running in GitHub Actions; no-op.
+            pass
+    except Exception as e:
+        print(f"[CI] Failed to write Node 24 opt-in to GITHUB_ENV: {e}", file=sys.stderr)
 
 def main() -> int:
+    # Proactively opt into Node 24 for later steps in the same job.
+    opt_into_node24_for_github_actions()
+
     print(f"[GX] great_expectations version: {gx.__version__}")
 
     # Load data
@@ -37,69 +44,71 @@ def main() -> int:
         print(f"[GX] Missing expected columns: {missing}", file=sys.stderr)
         return 2
 
-    # Coerce numerics (prevents false failures when CSV has strings)
+    # Coerce numerics (avoids false negatives when numbers are strings)
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Ephemeral context (no disk writes)
+    # 1) Ephemeral context (in‑memory, nothing persisted to disk)
     ctx = gx.get_context(mode="ephemeral")
 
-    # Build a Batch from a Pandas DataFrame (Fluent API)
+    # 2) Pandas → DataFrame Asset → Batch (whole DataFrame)
     ds = ctx.data_sources.add_pandas(name="bars_reader")
     asset = ds.add_dataframe_asset(name="bars_df")
     bd = asset.add_batch_definition_whole_dataframe("whole_df")
     batch = bd.get_batch(batch_parameters={"dataframe": df})
 
-    # Build ExpectationSuite and add expectations (typed Expectation objects)
+    # 3) Expectation Suite and Expectations (typed expectation objects)
     suite = gx.ExpectationSuite(name="bars_suite")
 
-    # 1) Row count
+    # Row count
     suite.add_expectation(
-        expectation=ExpectTableRowCountToBeBetween(min_value=100, max_value=100_000)
+        gxe.ExpectTableRowCountToBeBetween(min_value=100, max_value=100_000)
     )
 
-    # 2) Not-nulls
+    # Not-null constraints
     for col in expected_cols:
-        suite.add_expectation(expectation=ExpectColumnValuesToNotBeNull(column=col))
+        suite.add_expectation(gxe.ExpectColumnValuesToNotBeNull(column=col))
 
-    # 3) Reasonable numeric ranges
+    # Price bounds (0 .. 10M)
     for col in ["open", "high", "low", "close"]:
         suite.add_expectation(
-            expectation=ExpectColumnValuesToBeBetween(
+            gxe.ExpectColumnValuesToBeBetween(
                 column=col, min_value=0, max_value=10_000_000
             )
         )
+
+    # Volume nonnegative
     suite.add_expectation(
-        expectation=ExpectColumnValuesToBeBetween(column="volume", min_value=0)
+        gxe.ExpectColumnValuesToBeBetween(column="volume", min_value=0)
     )
 
-    # 4) OHLC relationships
+    # OHLC relationships
     suite.add_expectation(
-        expectation=ExpectColumnPairValuesAToBeGreaterThanB(
+        gxe.ExpectColumnPairValuesAToBeGreaterThanB(
             column_A="high", column_B="low", or_equal=True
         )
     )
     for col in ["open", "close"]:
         suite.add_expectation(
-            expectation=ExpectColumnPairValuesAToBeGreaterThanB(
+            gxe.ExpectColumnPairValuesAToBeGreaterThanB(
                 column_A=col, column_B="low", or_equal=True
             )
         )
         suite.add_expectation(
-            expectation=ExpectColumnPairValuesAToBeGreaterThanB(
+            gxe.ExpectColumnPairValuesAToBeGreaterThanB(
                 column_A="high", column_B=col, or_equal=True
             )
         )
 
-    # Register suite and validate
+    # Register suite (keeps API consistent)
     ctx.suites.add(suite)
-    result = validate_batch(batch, suite)
 
-    # Print the raw result (has success + details)
+    # 4) Validate — pass suite POSITIONALLY (compatible with your GX build)
+    result = batch.validate(suite)
     print(result)
 
+    # Optional: quick drill-down if it fails
     if not result.success:
-        # Quick drill-down on failures
         for r in result.validation_results:
             if not r.success:
                 etype = r.expectation_config.expectation_type
