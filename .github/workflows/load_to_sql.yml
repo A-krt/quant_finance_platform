@@ -1,0 +1,96 @@
+name: Load CSV into Delta via SQL Warehouse
+
+on:
+  workflow_run:
+    workflows: ["Ingest Synthetic Bars"]   # run after your ingest finishes
+    types: [completed]
+  workflow_dispatch:                        # allow manual runs too
+
+permissions:
+  contents: read
+
+jobs:
+  load-to-sql:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo to get latest.csv
+        uses: actions/checkout@v4
+
+      - name: Upload CSV to DBFS (overwrite)
+        env:
+          HOST: ${{ secrets.DATABRICKS_HOST }}
+          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          set -e
+          # Upload data/bars/latest.csv to dbfs:/FileStore/qf/latest.csv
+          curl -sS -X POST "$HOST/api/2.0/dbfs/put" \
+            -H "Authorization: Bearer $TOKEN" \
+            -F "path=/FileStore/qf/latest.csv" \
+            -F "overwrite=true" \
+            -F "contents=@data/bars/latest.csv" \
+            | tee dbfs_put.json
+
+      - name: Execute SQL on Serverless Warehouse (CREATE + COPY INTO)
+        env:
+          HOST: ${{ secrets.DATABRICKS_HOST }}
+          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        run: |
+          set -e
+
+          SQL=$(cat <<'EOSQL'
+          -- Create schema/table if not present
+          CREATE SCHEMA IF NOT EXISTS quant_finance;
+          CREATE TABLE IF NOT EXISTS quant_finance.bars_1m (
+            ts TIMESTAMP,
+            open DOUBLE,
+            high DOUBLE,
+            low  DOUBLE,
+            close DOUBLE,
+            volume DOUBLE
+          )
+          USING DELTA;
+
+          -- Load the freshly uploaded CSV into the Delta table
+          COPY INTO quant_finance.bars_1m
+          FROM 'dbfs:/FileStore/qf/latest.csv'
+          FILEFORMAT = CSV
+          FORMAT_OPTIONS ('header'='true');
+          EOSQL
+          )
+
+          # Submit statement to the SQL warehouse (Statement Execution API 2.0)
+          submit=$(curl -sS -X POST "$HOST/api/2.0/sql/statements" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @- <<JSON
+          {
+            "statement": ${SQL@Q},
+            "warehouse_id": "$WAREHOUSE_ID"
+          }
+          JSON
+          )
+
+          echo "$submit" | tee submit.json
+          stmt_id=$(jq -r '.statement_id' <<< "$submit")
+
+          # Poll until the statement succeeds or fails
+          for i in $(seq 1 60); do
+            status=$(curl -sS -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
+              -H "Authorization: Bearer $TOKEN")
+            state=$(jq -r '.status.state' <<< "$status")
+            echo "State: $state"
+            if [ "$state" = "SUCCEEDED" ]; then
+              echo "$status" | tee final.json
+              exit 0
+            elif [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ]; then
+              echo "$status" | tee final.json
+              echo "SQL failed."
+              exit 1
+            fi
+            sleep 3
+          done
+
+          echo "Timed out waiting for SQL to finish."
+          exit 1
