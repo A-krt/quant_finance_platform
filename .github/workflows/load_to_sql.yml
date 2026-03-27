@@ -21,28 +21,39 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y jq python3-pip
 
-      # Build one SQL string: create schema/tables, then insert all CSV rows, then create the view
+      # (Optional) quick smoke test to verify SQL Warehouse + token works
+      - name: Smoke test Statement Execution (SELECT 1)
+        env:
+          HOST: ${{ secrets.DATABRICKS_HOST }}
+          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        run: |
+          set -euo pipefail
+          payload='{"statement":"SELECT 1","warehouse_id":"'"$WAREHOUSE_ID"'","wait_timeout":"10s","on_wait_timeout":"CONTINUE"}'
+          out=$(curl -sS -X POST "$HOST/api/2.0/sql/statements" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "$payload")
+          echo "$out" | jq .
+
       - name: Generate SQL from CSV (staging -> integration)
         run: |
           python3 - << 'PY'
           import csv
           rows = []
           with open("data/bars/latest.csv", newline="") as f:
-              r = csv.DictReader(f)
-              for row in r:
-                  ts = row["ts"]
-                  o  = row["open"]; h = row["high"]; l = row["low"]; c = row["close"]; v = row["volume"]
-                  # Use to_timestamp on ISO 8601; XXX = timezone offset like +00:00
-                  tup = f"(to_timestamp('{ts}','yyyy-MM-dd''T''HH:mm:ssXXX'),{o},{h},{l},{c},{v})"
-                  rows.append(tup)
+            r = csv.DictReader(f)
+            for row in r:
+              ts = row["ts"]
+              o  = row["open"]; h = row["high"]; l = row["low"]; c = row["close"]; v = row["volume"]
+              tup = f"(to_timestamp('{ts}','yyyy-MM-dd''T''HH:mm:ssXXX'),{o},{h},{l},{c},{v})"
+              rows.append(tup)
           values = ",\n  ".join(rows)
 
           sql = f"""
-          -- We are in hive_metastore (matches your UI)
+          -- Match your workspace view: hive_metastore.quant_finance
           USE CATALOG hive_metastore;
           CREATE SCHEMA IF NOT EXISTS quant_finance;
 
-          -- STAGING table (append-only)
+          -- STAGING table: append-only with ingest_run_ts
           CREATE TABLE IF NOT EXISTS quant_finance.bars_1m_staging (
             ts TIMESTAMP,
             open DOUBLE,
@@ -54,7 +65,7 @@ jobs:
           )
           USING DELTA;
 
-          -- Option A: replace staging completely each run (uncomment TRUNCATE)
+          -- To replace staging each run instead of append, uncomment:
           -- TRUNCATE TABLE quant_finance.bars_1m_staging;
 
           INSERT INTO quant_finance.bars_1m_staging (ts, open, high, low, close, volume)
@@ -79,173 +90,79 @@ jobs:
           open("sql_to_run.sql","w").write(sql)
           PY
 
-       - name: Execute SQL on the Serverless Warehouse (Statement Execution API)
-  env:
-    HOST: ${{ secrets.DATABRICKS_HOST }}
-    TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-    WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
-  run: |
-    set -euo pipefail
+      - name: Execute SQL on the Serverless Warehouse (Statement Execution API)
+        env:
+          HOST: ${{ secrets.DATABRICKS_HOST }}
+          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        run: |
+          set -euo pipefail
 
-    # Build request payload with a short synchronous wait
-    payload=$(jq -n --rawfile sql sql_to_run.sql --arg wid "$WAREHOUSE_ID" \
-      '{statement:$sql,
-        warehouse_id:$wid,
-        catalog:"hive_metastore",
-        wait_timeout:"10s",
-        on_wait_timeout:"CONTINUE"}')
+          # Build payload with short synchronous wait (hybrid mode)
+          payload=$(jq -n --rawfile sql sql_to_run.sql --arg wid "$WAREHOUSE_ID" \
+            '{statement:$sql, warehouse_id:$wid, catalog:"hive_metastore",
+              wait_timeout:"10s", on_wait_timeout:"CONTINUE"}')
 
-    echo "Submitting statement..."
-    submit=$(curl -sS -w '\n%{http_code}' -X POST "$HOST/api/2.0/sql/statements" \
-      -H "Authorization: Bearer $TOKEN" \
-      -H "Content-Type: application/json" \
-      -d "$payload")
+          echo "Submitting statement..."
+          submit=$(curl -sS -w '\n%{http_code}' -X POST "$HOST/api/2.0/sql/statements" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
 
-    # split body / http code for visibility
-    body=$(printf "%s" "$submit" | sed '$d')
-    code=$(printf "%s" "$submit" | tail -n1)
+          body=$(printf "%s" "$submit" | sed '$d')
+          code=$(printf "%s" "$submit" | tail -n1)
 
-    echo "::group::Submit response ($code)"
-    echo "$body" | jq .
-    echo "::endgroup::"
+          echo "::group::Submit response ($code)"
+          echo "$body" | jq .
+          echo "::endgroup::"
 
-    # If POST returned an error, fail early
-    if [ "$code" -ge 400 ]; then
-      echo "POST /sql/statements failed (HTTP $code)"
-      exit 1
-    fi
+          if [ "$code" -ge 400 ]; then
+            echo "POST /sql/statements failed (HTTP $code)"
+            exit 1
+          fi
 
-    # Check if it already finished in the synchronous window
-    st=$(echo "$body" | jq -r '.status.state // empty')
-    if [ "$st" = "SUCCEEDED" ]; then
-      echo "Statement finished synchronously."
-      exit 0
-    fi
+          st=$(echo "$body" | jq -r '.status.state // empty')
+          if [ "$st" = "SUCCEEDED" ]; then
+            echo "Statement finished synchronously."
+            exit 0
+          fi
 
-    # Otherwise grab the statement id and poll
-    stmt_id=$(echo "$body" | jq -r '.statement_id // empty')
-    if [ -z "$stmt_id" ]; then
-      echo "No statement_id and no SUCCEEDED status in submit response. Aborting."
-      exit 1
-    fi
+          stmt_id=$(echo "$body" | jq -r '.statement_id // empty')
+          if [ -z "$stmt_id" ]; then
+            echo "No statement_id and no SUCCEEDED status in submit response. Aborting."
+            exit 1
+          fi
 
-    echo "Polling statement_id: $stmt_id"
-    for i in $(seq 1 80); do
-      resp=$(curl -sS -w '\n%{http_code}' -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
-        -H "Authorization: Bearer $TOKEN")
-      rbody=$(printf "%s" "$resp" | sed '$d')
-      rcode=$(printf "%s" "$resp" | tail -n1)
+          echo "Polling statement_id: $stmt_id"
+          for i in $(seq 1 80); do
+            resp=$(curl -sS -w '\n%{http_code}' -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
+              -H "Authorization: Bearer $TOKEN")
+            rbody=$(printf "%s" "$resp" | sed '$d')
+            rcode=$(printf "%s" "$resp" | tail -n1)
 
-      state=$(echo "$rbody" | jq -r '.status.state // empty')
-      err=$(echo "$rbody" | jq -r '.error.message // empty')
+            state=$(echo "$rbody" | jq -r '.status.state // empty')
+            err=$(echo "$rbody" | jq -r '.error.message // empty')
 
-      echo "Poll #$i: HTTP=$rcode state=${state:-<none>} err=${err:-<none>}"
+            echo "Poll #$i: HTTP=$rcode state=${state:-<none>} err=${err:-<none>}"
 
-      # Show full response if we don't see a state (helps when it's an error payload)
-      if [ -z "${state:-}" ]; then
-        echo "::group::Full GET payload"
-        echo "$rbody" | jq .
-        echo "::endgroup::"
-      fi
+            if [ -z "${state:-}" ]; then
+              echo "::group::Full GET payload"
+              echo "$rbody" | jq .
+              echo "::endgroup::"
+            fi
 
-      if [ "$state" = "SUCCEEDED" ]; then
-        echo "::group::Final payload"
-        echo "$rbody" | jq .
-        echo "::endgroup::"
-        exit 0
-      elif [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ] || [ "$rcode" -ge 400 ]; then
-        echo "Statement failed or canceled."
-        echo "$rbody" | jq .
-        exit 1
-      fi
+            if [ "$state" = "SUCCEEDED" ]; then
+              echo "::group::Final payload"
+              echo "$rbody" | jq .
+              echo "::endgroup::"
+              exit 0
+            elif [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ] || [ "$rcode" -ge 400 ]; then
+              echo "Statement failed or canceled."
+              echo "$rbody" | jq .
+              exit 1
+            fi
+            sleep 2
+          done
 
-      sleep 2
-    done
-
-    echo "Timed out waiting for SQL to finish"
-    exit 1
-    - name: Execute SQL on the Serverless Warehouse (Statement Execution API)
-  env:
-    HOST: ${{ secrets.DATABRICKS_HOST }}
-    TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-    WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
-  run: |
-    set -euo pipefail
-
-    # Build request payload with a short synchronous wait
-    payload=$(jq -n --rawfile sql sql_to_run.sql --arg wid "$WAREHOUSE_ID" \
-      '{statement:$sql,
-        warehouse_id:$wid,
-        catalog:"hive_metastore",
-        wait_timeout:"10s",
-        on_wait_timeout:"CONTINUE"}')
-
-    echo "Submitting statement..."
-    submit=$(curl -sS -w '\n%{http_code}' -X POST "$HOST/api/2.0/sql/statements" \
-      -H "Authorization: Bearer $TOKEN" \
-      -H "Content-Type: application/json" \
-      -d "$payload")
-
-    # split body / http code for visibility
-    body=$(printf "%s" "$submit" | sed '$d')
-    code=$(printf "%s" "$submit" | tail -n1)
-
-    echo "::group::Submit response ($code)"
-    echo "$body" | jq .
-    echo "::endgroup::"
-
-    # If POST returned an error, fail early
-    if [ "$code" -ge 400 ]; then
-      echo "POST /sql/statements failed (HTTP $code)"
-      exit 1
-    fi
-
-    # Check if it already finished in the synchronous window
-    st=$(echo "$body" | jq -r '.status.state // empty')
-    if [ "$st" = "SUCCEEDED" ]; then
-      echo "Statement finished synchronously."
-      exit 0
-    fi
-
-    # Otherwise grab the statement id and poll
-    stmt_id=$(echo "$body" | jq -r '.statement_id // empty')
-    if [ -z "$stmt_id" ]; then
-      echo "No statement_id and no SUCCEEDED status in submit response. Aborting."
-      exit 1
-    fi
-
-    echo "Polling statement_id: $stmt_id"
-    for i in $(seq 1 80); do
-      resp=$(curl -sS -w '\n%{http_code}' -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
-        -H "Authorization: Bearer $TOKEN")
-      rbody=$(printf "%s" "$resp" | sed '$d')
-      rcode=$(printf "%s" "$resp" | tail -n1)
-
-      state=$(echo "$rbody" | jq -r '.status.state // empty')
-      err=$(echo "$rbody" | jq -r '.error.message // empty')
-
-      echo "Poll #$i: HTTP=$rcode state=${state:-<none>} err=${err:-<none>}"
-
-      # Show full response if we don't see a state (helps when it's an error payload)
-      if [ -z "${state:-}" ]; then
-        echo "::group::Full GET payload"
-        echo "$rbody" | jq .
-        echo "::endgroup::"
-      fi
-
-      if [ "$state" = "SUCCEEDED" ]; then
-        echo "::group::Final payload"
-        echo "$rbody" | jq .
-        echo "::endgroup::"
-        exit 0
-      elif [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ] || [ "$rcode" -ge 400 ]; then
-        echo "Statement failed or canceled."
-        echo "$rbody" | jq .
-        exit 1
-      fi
-
-      sleep 2
-    done
-
-    echo "Timed out waiting for SQL to finish"
-    exit 1
+          echo "Timed out waiting for SQL to finish"
+          exit 1
