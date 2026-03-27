@@ -17,19 +17,22 @@ jobs:
       - name: Checkout repo to get latest.csv
         uses: actions/checkout@v4
 
-      - name: Upload CSV to DBFS (overwrite same path)
+      - name: Install jq + Databricks CLI
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+        shell: bash
+
+      - name: Authenticate CLI
         env:
           HOST: ${{ secrets.DATABRICKS_HOST }}
           TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
-          set -e
-          # Upload data/bars/latest.csv to a fixed path (simple folder). We reload it on every run.
-          curl -sS -X POST "$HOST/api/2.0/dbfs/put" \
-            -H "Authorization: Bearer $TOKEN" \
-            -F "path=/FileStore/qf/latest.csv" \
-            -F "overwrite=true" \
-            -F "contents=@data/bars/latest.csv" \
-            | tee dbfs_put.json
+          databricks auth login --host "$HOST" --token "$TOKEN"
+
+      - name: Upload CSV to DBFS (overwrite same path)
+        run: |
+          databricks fs cp --overwrite data/bars/latest.csv dbfs:/FileStore/qf/latest.csv
 
       - name: Execute SQL on Serverless Warehouse (CREATE + COPY INTO + tag + views)
         env:
@@ -37,10 +40,13 @@ jobs:
           TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
         run: |
-          set -e
+          set -euo pipefail
 
-          SQL=$(cat <<'EOSQL'
-          -- 1) Ensure schema & table exist (table includes the tagging column)
+          read -r -d '' SQL <<'EOSQL'
+          -- (optional) pick an explicit catalog to avoid ambiguity
+          -- USE CATALOG main;
+
+          -- 1) Ensure schema & table exist
           CREATE SCHEMA IF NOT EXISTS quant_finance;
 
           CREATE TABLE IF NOT EXISTS quant_finance.bars_1m (
@@ -54,63 +60,52 @@ jobs:
           )
           USING DELTA;
 
-          -- 2) Reload the single file *every run* (override default idempotency)
-          --    COPY INTO normally *skips* previously ingested paths even if modified;
-          --    'force=true' tells it to re-process the same path cleanly.
+          -- 2) Re-load the same file each run
           COPY INTO quant_finance.bars_1m
           FROM 'dbfs:/FileStore/qf/latest.csv'
           FILEFORMAT = CSV
           FORMAT_OPTIONS ('header'='true')
           COPY_OPTIONS ('force'='true');
 
-          -- 3) Tag only the newly appended rows (existing rows retain their tag)
+          -- 3) Tag newly ingested rows
           UPDATE quant_finance.bars_1m
           SET ingest_run_ts = current_timestamp()
           WHERE ingest_run_ts IS NULL;
 
-          -- 4a) “Active” view: exposes a simple boolean flag for the latest batch
+          -- 4a) Active view (flags rows from the latest batch)
           CREATE OR REPLACE VIEW quant_finance.bars_1m_active AS
           SELECT
             t.*,
-            CASE
-              WHEN t.ingest_run_ts = (SELECT max(ingest_run_ts) FROM quant_finance.bars_1m)
-              THEN true ELSE false
-            END AS is_active
+            CASE WHEN t.ingest_run_ts = (SELECT max(ingest_run_ts) FROM quant_finance.bars_1m)
+                 THEN true ELSE false END AS is_active
           FROM quant_finance.bars_1m t;
 
-          -- 4b) Silver view (optional): dedupe one row per ts, keeping newest batch
+          -- 4b) Silver view (dedupe per ts by newest batch)
           CREATE OR REPLACE VIEW quant_finance.bars_1m_silver AS
           WITH ranked AS (
-            SELECT *,
-                   row_number() OVER (PARTITION BY ts ORDER BY ingest_run_ts DESC) AS rn
+            SELECT *, row_number() OVER (PARTITION BY ts ORDER BY ingest_run_ts DESC) rn
             FROM quant_finance.bars_1m
           )
           SELECT ts, open, high, low, close, volume, ingest_run_ts
-          FROM ranked
-          WHERE rn = 1;
+          FROM ranked WHERE rn = 1;
           EOSQL
-          )
 
-          # Submit statement to the SQL warehouse (Statement Execution API 2.0)
-          submit=$(curl -sS -X POST "$HOST/api/2.0/sql/statements" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -d @- <<JSON
-          {
-            "statement": ${SQL@Q},
-            "warehouse_id": "$WAREHOUSE_ID"
-          }
-          JSON
-          )
+          # Submit statement to the SQL warehouse
+          submit=$(jq -n --arg sql "$SQL" --arg wid "$WAREHOUSE_ID" \
+            '{statement:$sql, warehouse_id:$wid}' |
+            curl -sS -X POST "$HOST/api/2.0/sql/statements" \
+              -H "Authorization: Bearer '"$TOKEN"'" \
+              -H "Content-Type: application/json" \
+              -d @-)
 
           echo "$submit" | tee submit.json
-          stmt_id=$(jq -r '.statement_id' <<< "$submit")
+          stmt_id=$(jq -r '.statement_id' <<<"$submit")
 
-          # Poll until the statement succeeds or fails
+          # Poll for completion
           for i in $(seq 1 60); do
             status=$(curl -sS -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
               -H "Authorization: Bearer $TOKEN")
-            state=$(jq -r '.status.state' <<< "$status")
+            state=$(jq -r '.status.state' <<<"$status")
             echo "State: $state"
             if [ "$state" = "SUCCEEDED" ]; then
               echo "$status" | tee final.json
