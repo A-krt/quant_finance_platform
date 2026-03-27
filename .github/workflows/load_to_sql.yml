@@ -14,8 +14,10 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     env:
-      # Set your UC catalog here; from the screenshot it's "workspace"
+      # Your UC catalog (from SHOW CATALOGS and current_catalog() = workspace)
       DATABRICKS_CATALOG: workspace
+      # Opt-in to Node 24 to silence the deprecation banner (optional)
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout repo to get latest.csv
         uses: actions/checkout@v4
@@ -65,16 +67,16 @@ jobs:
           catalog = os.environ.get("DATABRICKS_CATALOG","workspace")
           rows = []
           with open("data/bars/latest.csv", newline="") as f:
-            r = csv.DictReader(f)
-            for row in r:
-              ts = row["ts"]
-              o  = row["open"]; h = row["high"]; l = row["low"]; c = row["close"]; v = row["volume"]
-              tup = f"(to_timestamp('{ts}','yyyy-MM-dd''T''HH:mm:ssXXX'),{o},{h},{l},{c},{v})"
-              rows.append(tup)
+              r = csv.DictReader(f)
+              for row in r:
+                  ts = row["ts"]
+                  o  = row["open"]; h = row["high"]; l = row["low"]; c = row["close"]; v = row["volume"]
+                  tup = f"(to_timestamp('{ts}','yyyy-MM-dd''T''HH:mm:ssXXX'),{o},{h},{l},{c},{v})"
+                  rows.append(tup)
           values = ",\n  ".join(rows)
 
           sql = f"""
-          -- Match your workspace view: {catalog}.quant_finance
+          -- Use your UC default catalog
           USE CATALOG {catalog};
           CREATE SCHEMA IF NOT EXISTS quant_finance;
 
@@ -125,13 +127,13 @@ jobs:
           set -euo pipefail
           HOST="${HOST%/}"
 
-          # Read the multi-statement SQL and split into individual statements (preserve newlines)
+          # Split multi-statement SQL into single statements (NUL-delimited to preserve newlines)
           mapfile -d '' -t statements < <(python3 << 'PY'
           with open("sql_to_run.sql") as f:
-            content = f.read()
+              content = f.read()
           stmts = [s.strip() for s in content.split(';') if s.strip()]
           for s in stmts:
-            print(s, end='\0')
+              print(s, end='\0')
           PY
           )
 
@@ -164,6 +166,7 @@ jobs:
               return 1
             fi
 
+            # If it finished in the 10s window, we're done
             st=$(echo "$body" | jq -r '.status.state // empty')
             if [ "$st" = "SUCCEEDED" ]; then
               echo "Statement finished synchronously."
@@ -188,16 +191,17 @@ jobs:
 
               echo "Poll #$i: HTTP=$rcode state=${state:-<none>} err=${err:-<none>}"
 
+              # Show payload if state missing (usually an error payload)
               if [ -z "${state:-}" ]; then
                 echo "::group::Full GET payload"
                 echo "$rbody" | jq .
                 echo "::endgroup::"
               fi
 
-              if [ "$state" = "SUCCEEDED" ] {
+              if [ "$state" = "SUCCEEDED" ]; then
                 echo "Statement SUCCEEDED."
                 return 0
-              } elif [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ] || [ "$rcode" -ge 400 ]; then
+              elif [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ] || [ "$rcode" -ge 400 ]; then
                 echo "Statement failed or canceled."
                 echo "$rbody" | jq .
                 return 1
@@ -209,6 +213,7 @@ jobs:
             return 1
           }
 
+          # Execute each statement sequentially
           for s in "${statements[@]}"; do
             echo "------ Executing SQL ------"
             echo "$s"
