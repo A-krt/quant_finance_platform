@@ -1,0 +1,26 @@
+import sys, pandas as pd
+import great_expectations as gx
+
+CSV = "data/bars/latest.csv"
+df = pd.read_csv(CSV, parse_dates=["ts"])
+
+ctx = gx.get_context(mode="ephemeral")
+reader = ctx.sources.add_or_update_pandas(name="bars_reader")
+asset = reader.add_dataframe_asset(name="bars_df")
+batch = asset.get_batch(list_of_batch_parameters=[{"dataframe": df}])
+
+suite = ctx.suites.add_or_update("bars_suite")
+suite.add_expectation("expect_table_row_count_to_be_between",
+                      {"min_value": 100, "max_value": 100_000})
+for col in ["ts","open","high","low","close","volume"]:
+    suite.add_expectation("expect_column_values_to_not_be_null", {"column": col})
+for col in ["open","high","low","close"]:
+    suite.add_expectation("expect_column_values_to_be_between",
+                          {"column": col, "min_value": 0, "max_value": 10_000_000})
+suite.add_expectation("expect_column_values_to_be_between",
+                      {"column": "volume", "min_value": 0})
+
+result = batch.validate(expectation_suite=suite)
+print(result)
+if not result["success"]:
+    sys.exit("GX validation failed; aborting commit.")
