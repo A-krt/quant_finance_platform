@@ -11,7 +11,22 @@ from great_expectations.expectations.core import (
 
 CSV = "data/bars/latest.csv"
 
+def validate_batch(batch, suite):
+    """
+    Be robust across GX builds where Batch.validate accepts:
+      - positional (suite) OR
+      - keyword (expectation_suite=suite)
+    """
+    try:
+        # Prefer positional — your CI build rejects the keyword form
+        return batch.validate(suite)
+    except TypeError:
+        # Some builds only accept the keyword
+        return batch.validate(expectation_suite=suite)
+
 def main() -> int:
+    print(f"[GX] great_expectations version: {gx.__version__}")
+
     # Load data
     df = pd.read_csv(CSV, parse_dates=["ts"])
 
@@ -26,10 +41,10 @@ def main() -> int:
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Ephemeral context (no disk writes, no project directory needed)
+    # Ephemeral context (no disk writes)
     ctx = gx.get_context(mode="ephemeral")
 
-    # Build a Batch from a Pandas DataFrame (Fluent)
+    # Build a Batch from a Pandas DataFrame (Fluent API)
     ds = ctx.data_sources.add_pandas(name="bars_reader")
     asset = ds.add_dataframe_asset(name="bars_df")
     bd = asset.add_batch_definition_whole_dataframe("whole_df")
@@ -59,13 +74,11 @@ def main() -> int:
     )
 
     # 4) OHLC relationships
-    # high >= low
     suite.add_expectation(
         expectation=ExpectColumnPairValuesAToBeGreaterThanB(
             column_A="high", column_B="low", or_equal=True
         )
     )
-    # open, close must lie within [low, high]
     for col in ["open", "close"]:
         suite.add_expectation(
             expectation=ExpectColumnPairValuesAToBeGreaterThanB(
@@ -80,12 +93,13 @@ def main() -> int:
 
     # Register suite and validate
     ctx.suites.add(suite)
-    result = batch.validate(expectation_suite=suite)
+    result = validate_batch(batch, suite)
 
-    # Minimal readable summary and failures drill-down
+    # Print the raw result (has success + details)
     print(result)
+
     if not result.success:
-        # Show which expectations failed for quick debugging
+        # Quick drill-down on failures
         for r in result.validation_results:
             if not r.success:
                 etype = r.expectation_config.expectation_type
