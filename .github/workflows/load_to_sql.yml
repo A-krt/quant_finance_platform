@@ -2,9 +2,9 @@ name: Load CSV into Delta via SQL Warehouse
 
 on:
   workflow_run:
-    workflows: ["Ingest Synthetic Bars"]   # run after your ingest finishes
+    workflows: ["Ingest Synthetic Bars"]
     types: [completed]
-  workflow_dispatch:                        # allow manual runs too
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,6 +21,8 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y jq
           curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          databricks version
         shell: bash
 
       - name: Upload CSV to DBFS (overwrite same path)
@@ -28,6 +30,7 @@ jobs:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
+          databricks fs mkdirs dbfs:/FileStore/qf || true
           databricks fs cp --overwrite data/bars/latest.csv dbfs:/FileStore/qf/latest.csv
 
       - name: Execute SQL on Serverless Warehouse (CREATE + COPY INTO + tag + views)
@@ -39,8 +42,7 @@ jobs:
           set -euo pipefail
 
           read -r -d '' SQL <<'EOSQL'
-          -- optional: pin catalog so schema lands where you expect
-          -- USE CATALOG main;
+          -- USE CATALOG hive_metastore;   -- or: USE CATALOG main;
 
           CREATE SCHEMA IF NOT EXISTS quant_finance;
 
@@ -80,7 +82,7 @@ jobs:
           FROM ranked WHERE rn = 1;
           EOSQL
 
-          # Submit SQL to the Statement Execution API 2.0
+          # Submit SQL to the Statement Execution API 2.0 (runs on your SQL warehouse)
           submit=$(jq -n --arg sql "$SQL" --arg wid "$WAREHOUSE_ID" \
             '{statement:$sql, warehouse_id:$wid}' |
             curl -sS -X POST "$HOST/api/2.0/sql/statements" \
@@ -89,13 +91,13 @@ jobs:
               -d @-)
 
           echo "$submit" | tee submit.json
-          stmt_id=$(jq -r '.statement_id' <<<"$submit")
+          stmt_id=$(jq -r '.statement_id' <<< "$submit")
 
           # Poll until done
           for i in $(seq 1 60); do
             status=$(curl -sS -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
               -H "Authorization: Bearer $TOKEN")
-            state=$(jq -r '.status.state' <<<"$status")
+            state=$(jq -r '.status.state' <<< "$status")
             echo "State: $state"
             if [ "$state" = "SUCCEEDED" ]; then
               echo "$status" | tee final.json
