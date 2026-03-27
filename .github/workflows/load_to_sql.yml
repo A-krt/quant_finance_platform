@@ -21,16 +21,16 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y jq python3-pip
 
-          - name: Debug env vars (lengths only)
-            env:
-              HOST: ${{ secrets.DATABRICKS_HOST }}
-              TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-              WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
-            run: |
-              set -e
-              echo "HOST length: ${#HOST}"
-              echo "TOKEN length: ${#TOKEN}"
-              echo "WAREHOUSE_ID: $WAREHOUSE_ID"
+      - name: Debug env vars (lengths only)
+        env:
+          HOST: ${{ secrets.DATABRICKS_HOST }}
+          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        run: |
+          set -e
+          echo "HOST length: ${#HOST}"
+          echo "TOKEN length: ${#TOKEN}"
+          echo "WAREHOUSE_ID: $WAREHOUSE_ID"
 
       # Quick sanity that HOST/TOKEN/WAREHOUSE_ID are all good
       - name: Smoke test Statement Execution (SELECT 1)
