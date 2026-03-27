@@ -13,6 +13,9 @@ jobs:
   load-to-sql:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
+    env:
+      # Set your UC catalog here; from the screenshot it's "workspace"
+      DATABRICKS_CATALOG: workspace
     steps:
       - name: Checkout repo to get latest.csv
         uses: actions/checkout@v4
@@ -26,22 +29,27 @@ jobs:
           HOST: ${{ secrets.DATABRICKS_HOST }}
           TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+          DATABRICKS_CATALOG: ${{ env.DATABRICKS_CATALOG }}
         run: |
           set -e
           echo "HOST length: ${#HOST}"
           echo "TOKEN length: ${#TOKEN}"
           echo "WAREHOUSE_ID: $WAREHOUSE_ID"
+          echo "CATALOG: $DATABRICKS_CATALOG"
 
-      # Quick sanity that HOST/TOKEN/WAREHOUSE_ID are all good
       - name: Smoke test Statement Execution (SELECT 1)
         env:
           HOST: ${{ secrets.DATABRICKS_HOST }}
           TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+          DATABRICKS_CATALOG: ${{ env.DATABRICKS_CATALOG }}
         run: |
           set -euo pipefail
-          HOST="${HOST%/}"  # normalize trailing slash
-          payload='{"statement":"SELECT 1","warehouse_id":"'"$WAREHOUSE_ID"'","wait_timeout":"10s","on_wait_timeout":"CONTINUE"}'
+          HOST="${HOST%/}"
+          payload=$(jq -n \
+            --arg wid "$WAREHOUSE_ID" \
+            --arg cat "$DATABRICKS_CATALOG" \
+            '{statement:"SELECT 1", warehouse_id:$wid, catalog:$cat, wait_timeout:"10s", on_wait_timeout:"CONTINUE"}')
           out=$(curl -sS -X POST "$HOST/api/2.0/sql/statements" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
@@ -49,9 +57,12 @@ jobs:
           echo "$out" | jq .
 
       - name: Generate SQL from CSV (staging -> integration)
+        env:
+          DATABRICKS_CATALOG: ${{ env.DATABRICKS_CATALOG }}
         run: |
           python3 - << 'PY'
-          import csv
+          import csv, os
+          catalog = os.environ.get("DATABRICKS_CATALOG","workspace")
           rows = []
           with open("data/bars/latest.csv", newline="") as f:
             r = csv.DictReader(f)
@@ -63,8 +74,8 @@ jobs:
           values = ",\n  ".join(rows)
 
           sql = f"""
-          -- Match your workspace view: hive_metastore.quant_finance
-          USE CATALOG hive_metastore;
+          -- Match your workspace view: {catalog}.quant_finance
+          USE CATALOG {catalog};
           CREATE SCHEMA IF NOT EXISTS quant_finance;
 
           -- STAGING table: append-only with ingest_run_ts
@@ -109,31 +120,30 @@ jobs:
           HOST: ${{ secrets.DATABRICKS_HOST }}
           TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+          DATABRICKS_CATALOG: ${{ env.DATABRICKS_CATALOG }}
         run: |
           set -euo pipefail
-          HOST="${HOST%/}"  # normalize trailing slash
+          HOST="${HOST%/}"
 
           # Read the multi-statement SQL and split into individual statements (preserve newlines)
           mapfile -d '' -t statements < <(python3 << 'PY'
           with open("sql_to_run.sql") as f:
             content = f.read()
-          # naive split by ';' - safe for our script (no semicolons inside string literals)
           stmts = [s.strip() for s in content.split(';') if s.strip()]
           for s in stmts:
-            print(s, end='\0')   # NUL-delimit each statement to avoid line-splitting in bash
+            print(s, end='\0')
           PY
           )
 
           echo "Found ${#statements[@]} statements to execute."
 
-          # Function to submit and poll one statement
           run_stmt () {
             local stmt="$1"
 
-            payload=$(jq -n --arg sql "$stmt" --arg wid "$WAREHOUSE_ID" \
+            payload=$(jq -n --arg sql "$stmt" --arg wid "$WAREHOUSE_ID" --arg cat "$DATABRICKS_CATALOG" \
               '{statement:$sql,
                 warehouse_id:$wid,
-                catalog:"hive_metastore",
+                catalog:$cat,
                 wait_timeout:"10s",
                 on_wait_timeout:"CONTINUE"}')
 
@@ -154,7 +164,6 @@ jobs:
               return 1
             fi
 
-            # If it finished in the 10s window, we're done
             st=$(echo "$body" | jq -r '.status.state // empty')
             if [ "$st" = "SUCCEEDED" ]; then
               echo "Statement finished synchronously."
@@ -179,17 +188,16 @@ jobs:
 
               echo "Poll #$i: HTTP=$rcode state=${state:-<none>} err=${err:-<none>}"
 
-              # Show payload if state missing (usually an error payload)
               if [ -z "${state:-}" ]; then
                 echo "::group::Full GET payload"
                 echo "$rbody" | jq .
                 echo "::endgroup::"
               fi
 
-              if [ "$state" = "SUCCEEDED" ]; then
+              if [ "$state" = "SUCCEEDED" ] {
                 echo "Statement SUCCEEDED."
                 return 0
-              elif [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ] || [ "$rcode" -ge 400 ]; then
+              } elif [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ] || [ "$rcode" -ge 400 ]; then
                 echo "Statement failed or canceled."
                 echo "$rbody" | jq .
                 return 1
@@ -201,7 +209,6 @@ jobs:
             return 1
           }
 
-          # Execute each statement sequentially (stop on first failure due to set -e)
           for s in "${statements[@]}"; do
             echo "------ Executing SQL ------"
             echo "$s"
