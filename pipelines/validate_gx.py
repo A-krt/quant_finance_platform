@@ -1,8 +1,7 @@
-# pipelines/validate_gx.py
 import sys
 import pandas as pd
 import great_expectations as gx
-import great_expectations.expectations as gxe
+import great_expectations.expectations as gxe  # Expectation classes
 
 CSV = "data/bars/latest.csv"
 df = pd.read_csv(CSV, parse_dates=["ts"])
@@ -35,10 +34,26 @@ suite.add_expectation(
     gxe.ExpectColumnValuesToBeBetween(column="volume", min_value=0)
 )
 
-# Optional OHLC sanity (high >= low)
+# OHLC relationship: high >= low
+# Use the 'greater than B' class with or_equal=True (that's the supported API)
 suite.add_expectation(
-    gxe.ExpectColumnPairValuesAToBeGreaterThanOrEqualToB(column_A="high", column_B="low")
+    gxe.ExpectColumnPairValuesAToBeGreaterThanB(
+        column_A="high",
+        column_B="low",
+        or_equal=True
+    )
 )
+
+# (Optional) also ensure 'open'/'close' lie within [low, high]
+for col in ["open", "close"]:
+    suite.add_expectation(
+        gxe.ExpectColumnPairValuesAToBeGreaterThanB(column_A=col, column_B="low", or_equal=True)
+    )
+    # "less than or equal to" doesn't have a separate class; invert the comparison
+    # i.e., expect high >= col  <=>  expect col <= high
+    suite.add_expectation(
+        gxe.ExpectColumnPairValuesAToBeGreaterThanB(column_A="high", column_B=col, or_equal=True)
+    )
 
 ctx.suites.add(suite)
 
@@ -47,3 +62,4 @@ result = batch.validate(suite)
 print(result)
 if not result.success:
     sys.exit("GX validation failed; aborting commit.")
+``
