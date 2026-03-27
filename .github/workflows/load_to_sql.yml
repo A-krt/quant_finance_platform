@@ -9,10 +9,6 @@ on:
 permissions:
   contents: read
 
-# Optional: silence Node 20 deprecation warnings now.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   load-to-sql:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
@@ -21,81 +17,33 @@ jobs:
       - name: Checkout repo to get latest.csv
         uses: actions/checkout@v4
 
-      - name: Install jq + Databricks CLI
+      - name: Install jq and Python deps
         run: |
-          sudo apt-get update && sudo apt-get install -y jq
-          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          databricks version
-        shell: bash
+          sudo apt-get update && sudo apt-get install -y jq python3-pip
 
-      # Bootstrap the UC schema + volume BEFORE uploading
-      - name: Bootstrap schema + volume
-        env:
-          HOST: ${{ secrets.DATABRICKS_HOST }}
-          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+      # Build one SQL string: create schema/tables, then insert all CSV rows, then create the view
+      - name: Generate SQL from CSV (staging -> integration)
         run: |
-          set -euo pipefail
+          python3 - << 'PY'
+          import csv
+          rows = []
+          with open("data/bars/latest.csv", newline="") as f:
+              r = csv.DictReader(f)
+              for row in r:
+                  ts = row["ts"]
+                  o  = row["open"]; h = row["high"]; l = row["low"]; c = row["close"]; v = row["volume"]
+                  # Use to_timestamp on ISO 8601; XXX = timezone offset like +00:00
+                  tup = f"(to_timestamp('{ts}','yyyy-MM-dd''T''HH:mm:ssXXX'),{o},{h},{l},{c},{v})"
+                  rows.append(tup)
+          values = ",\n  ".join(rows)
 
-          # Pre-flight: fail early with a clear message if any secret is missing
-          : "${HOST:?Missing DATABRICKS_HOST secret}"
-          : "${TOKEN:?Missing DATABRICKS_TOKEN secret}"
-          : "${WAREHOUSE_ID:?Missing DATABRICKS_WAREHOUSE_ID secret}"
-
-          read -r -d '' SQL <<'EOSQL'
-          USE CATALOG main;
-          CREATE SCHEMA IF NOT EXISTS quant_finance;
-          CREATE VOLUME IF NOT EXISTS main.quant_finance.qf_staging;
-          EOSQL
-
-          submit=$(jq -n --arg sql "$SQL" --arg wid "$WAREHOUSE_ID" \
-            '{statement:$sql, warehouse_id:$wid, catalog:"main"}' |
-            curl -sS -X POST "$HOST/api/2.0/sql/statements" \
-              -H "Authorization: Bearer '"$TOKEN"'" \
-              -H "Content-Type: application/json" \
-              -d @-)
-
-          echo "$submit" | tee submit.json
-          stmt_id=$(jq -r '.statement_id // empty' <<< "$submit")
-          [ -z "$stmt_id" ] && { echo "Failed to submit bootstrap SQL (see submit.json above)"; exit 1; }
-
-          for i in $(seq 1 40); do
-            status=$(curl -sS -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
-              -H "Authorization: Bearer $TOKEN")
-            state=$(jq -r '.status.state' <<< "$status")
-            echo "Bootstrap state: $state"
-            [ "$state" = "SUCCEEDED" ] && exit 0
-            [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ] && { echo "$status"; exit 1; }
-            sleep 3
-          done
-          echo "Bootstrap SQL timed out"; exit 1
-
-      # Upload to a Unity Catalog Volume (requires PAT scope: files)
-      - name: Upload CSV to Volume (overwrite same path)
-        env:
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-        run: |
-          # Ensure directory exists (idempotent)
-          databricks fs mkdirs "dbfs:/Volumes/main/quant_finance/qf_staging" || true
-          # Upload the file
-          databricks fs cp --overwrite "data/bars/latest.csv" \
-            "dbfs:/Volumes/main/quant_finance/qf_staging/latest.csv"
-
-      - name: Execute SQL on Serverless Warehouse (CREATE + COPY INTO + tag + views)
-        env:
-          HOST: ${{ secrets.DATABRICKS_HOST }}
-          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
-        run: |
-          set -euo pipefail
-
-          read -r -d '' SQL <<'EOSQL'
-          USE CATALOG main;
+          sql = f"""
+          -- We are in hive_metastore (matches your UI)
+          USE CATALOG hive_metastore;
           CREATE SCHEMA IF NOT EXISTS quant_finance;
 
-          CREATE TABLE IF NOT EXISTS quant_finance.bars_1m (
+          -- STAGING table (append-only)
+          CREATE TABLE IF NOT EXISTS quant_finance.bars_1m_staging (
             ts TIMESTAMP,
             open DOUBLE,
             high DOUBLE,
@@ -106,47 +54,48 @@ jobs:
           )
           USING DELTA;
 
-          -- Re-ingest the same path every run
-          COPY INTO quant_finance.bars_1m
-          FROM 'dbfs:/Volumes/main/quant_finance/qf_staging/latest.csv'
-          FILEFORMAT = CSV
-          FORMAT_OPTIONS ('header'='true')
-          COPY_OPTIONS ('force'='true');
+          -- Option A: replace staging completely each run (uncomment TRUNCATE)
+          -- TRUNCATE TABLE quant_finance.bars_1m_staging;
 
-          -- Tag new rows from this run
-          UPDATE quant_finance.bars_1m
+          INSERT INTO quant_finance.bars_1m_staging (ts, open, high, low, close, volume)
+          VALUES
+            {values}
+          ;
+
+          UPDATE quant_finance.bars_1m_staging
           SET ingest_run_ts = current_timestamp()
           WHERE ingest_run_ts IS NULL;
 
-          -- “Active” view flags the newest batch
-          CREATE OR REPLACE VIEW quant_finance.bars_1m_active AS
-          SELECT t.*,
-                 CASE WHEN t.ingest_run_ts = (SELECT max(ingest_run_ts) FROM quant_finance.bars_1m)
-                      THEN true ELSE false END AS is_active
-          FROM quant_finance.bars_1m t;
-
-          -- Silver view: dedupe per ts by newest batch
-          CREATE OR REPLACE VIEW quant_finance.bars_1m_silver AS
+          -- INTEGRATION view: one row per ts (newest wins)
+          CREATE OR REPLACE VIEW quant_finance.bars_1m_integration AS
           WITH ranked AS (
-            SELECT *, row_number() OVER (PARTITION BY ts ORDER BY ingest_run_ts DESC) rn
-            FROM quant_finance.bars_1m
+            SELECT *,
+                   row_number() OVER (PARTITION BY ts ORDER BY ingest_run_ts DESC) rn
+            FROM quant_finance.bars_1m_staging
           )
           SELECT ts, open, high, low, close, volume, ingest_run_ts
           FROM ranked WHERE rn = 1;
-          EOSQL
+          """
+          open("sql_to_run.sql","w").write(sql)
+          PY
 
-          submit=$(jq -n --arg sql "$SQL" --arg wid "$WAREHOUSE_ID" \
-            '{statement:$sql, warehouse_id:$wid, catalog:"main"}' |
-            curl -sS -X POST "$HOST/api/2.0/sql/statements" \
-              -H "Authorization: Bearer '"$TOKEN"'" \
-              -H "Content-Type: application/json" \
-              -d @-)
+      - name: Execute SQL on the Serverless Warehouse (Statement Execution API)
+        env:
+          HOST: ${{ secrets.DATABRICKS_HOST }}
+          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -n --rawfile sql sql_to_run.sql --arg wid "$WAREHOUSE_ID" \
+            '{statement:$sql, warehouse_id:$wid, catalog:"hive_metastore"}')
+          submit=$(curl -sS -X POST "$HOST/api/2.0/sql/statements" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            -d "$payload")
+          stmt_id=$(jq -r '.statement_id' <<< "$submit")
+          [ -z "$stmt_id" ] && { echo "Failed to submit SQL"; echo "$submit"; exit 1; }
 
-          echo "$submit" | tee submit.json
-          stmt_id=$(jq -r '.statement_id // empty' <<< "$submit")
-          [ -z "$stmt_id" ] && { echo "Failed to submit ingestion SQL (see submit.json above)"; exit 1; }
-
-          for i in $(seq 1 60); do
+          # Poll for completion
+          for i in $(seq 1 80); do
             status=$(curl -sS -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
               -H "Authorization: Bearer $TOKEN")
             state=$(jq -r '.status.state' <<< "$status")
@@ -156,11 +105,8 @@ jobs:
               exit 0
             elif [ "$state" = "FAILED" ] || [ "$state" = "CANCELED" ]; then
               echo "$status" | tee final.json
-              echo "SQL failed."
               exit 1
             fi
-            sleep 3
+            sleep 2
           done
-
-          echo "Timed out waiting for SQL to finish."
-          exit 1
+          echo "Timed out waiting for SQL to finish"; exit 1
