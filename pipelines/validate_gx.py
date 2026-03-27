@@ -1,77 +1,65 @@
 import sys
 import pandas as pd
-import great_expectations as gx
-from great_expectations.expectations.core import (
-    ExpectTableRowCountToBeBetween,
-    ExpectColumnValuesToNotBeNull,
-    ExpectColumnValuesToBeBetween,
-    ExpectColumnPairValuesAToBeGreaterThanB,
-)
+import great_expectations as ge  # legacy alias
+from great_expectations.core.batch import BatchRequest
 
 CSV = "data/bars/latest.csv"
 df = pd.read_csv(CSV, parse_dates=["ts"])
 
-# Ensure numerics are truly numeric (prevents false failures):
 for c in ["open", "high", "low", "close", "volume"]:
     df[c] = pd.to_numeric(df[c], errors="coerce")
 
-# 1) Ephemeral context (in‑memory)
-ctx = gx.get_context(mode="ephemeral")
+context = ge.get_context()
 
-# 2) Build a Batch from a Pandas DataFrame
-ds = ctx.data_sources.add_pandas(name="bars_reader")
-asset = ds.add_dataframe_asset(name="bars_df")
-bd = asset.add_batch_definition_whole_dataframe("whole_df")
-batch = bd.get_batch(batch_parameters={"dataframe": df})
+# A quick runtime pandas datasource (names may vary per your config.yml)
+datasource_name = "pandas_runtime"
+if datasource_name not in [ds["name"] for ds in context.list_datasources()]:
+    context.add_datasource(
+        name=datasource_name,
+        class_name="Datasource",
+        execution_engine={"class_name": "PandasExecutionEngine"},
+        data_connectors={
+            "runtime_connector": {
+                "class_name": "RuntimeDataConnector",
+                "batch_identifiers": ["id"],
+            }
+        },
+    )
 
-# 3) Build an ExpectationSuite and add expectations
-suite = gx.ExpectationSuite(name="bars_suite")
+suite_name = "bars_suite"
+if suite_name not in [s["name"] for s in context.list_expectation_suites()]:
+    context.create_expectation_suite(suite_name)
 
-# Row count — your synthetic generator writes ~300 rows
-suite.add_expectation(
-    expectation=ExpectTableRowCountToBeBetween(min_value=100, max_value=100_000)
+validator = context.get_validator(
+    batch_request=BatchRequest(
+        datasource_name=datasource_name,
+        data_connector_name="runtime_connector",
+        data_asset_name="bars_df",
+        runtime_parameters={"batch_data": df},
+        batch_identifiers={"id": "run-1"},
+    ),
+    expectation_suite_name=suite_name,
 )
 
-# Not‑nulls
+# Add expectations via validator.* methods
+validator.expect_table_row_count_to_be_between(min_value=100, max_value=100_000)
+
 for col in ["ts", "open", "high", "low", "close", "volume"]:
-    suite.add_expectation(expectation=ExpectColumnValuesToNotBeNull(column=col))
+    validator.expect_column_values_to_not_be_null(column=col)
 
-# Reasonable numeric ranges
 for col in ["open", "high", "low", "close"]:
-    suite.add_expectation(
-        expectation=ExpectColumnValuesToBeBetween(column=col, min_value=0, max_value=10_000_000)
-    )
-suite.add_expectation(
-    expectation=ExpectColumnValuesToBeBetween(column="volume", min_value=0)
-)
+    validator.expect_column_values_to_be_between(column=col, min_value=0, max_value=10_000_000)
 
-# OHLC relationships
-# high >= low
-suite.add_expectation(
-    expectation=ExpectColumnPairValuesAToBeGreaterThanB(
-        column_A="high", column_B="low", or_equal=True
-    )
-)
-# open, close must lie within [low, high]
+validator.expect_column_values_to_be_between(column="volume", min_value=0)
+
+validator.expect_column_pair_values_a_to_be_greater_than_b("high", "low", or_equal=True)
 for col in ["open", "close"]:
-    suite.add_expectation(
-        expectation=ExpectColumnPairValuesAToBeGreaterThanB(
-            column_A=col, column_B="low", or_equal=True
-        )
-    )
-    suite.add_expectation(
-        expectation=ExpectColumnPairValuesAToBeGreaterThanB(
-            column_A="high", column_B=col, or_equal=True
-        )
-    )
+    validator.expect_column_pair_values_a_to_be_greater_than_b(col, "low", or_equal=True)
+    validator.expect_column_pair_values_a_to_be_greater_than_b("high", col, or_equal=True)
 
-# Register suite and validate
-ctx.suites.add(suite)
+# Validate
+res = validator.validate()
+print(res)
 
-result = batch.validate(expectation_suite=suite)
-
-# Pretty-print minimal summary; you can also do result.to_json_dict()
-print(result)
-
-if not result.success:
+if not res["success"]:
     sys.exit("GX validation failed; aborting commit.")
