@@ -1,123 +1,4 @@
-name: Load CSV into Delta via SQL Warehouse
-
-on:
-  workflow_run:
-    workflows: ["Ingest Synthetic Bars"]
-    types: [completed]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  load-to-sql:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
-    env:
-      # Your UC catalog (from SHOW CATALOGS and current_catalog() = workspace)
-      DATABRICKS_CATALOG: workspace
-      # Opt-in to Node 24 to silence the deprecation banner (optional)
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    steps:
-      - name: Checkout repo to get latest.csv
-        uses: actions/checkout@v4
-
-      - name: Install jq and Python deps
-        run: |
-          sudo apt-get update && sudo apt-get install -y jq python3-pip
-
-      - name: Debug env vars (lengths only)
-        env:
-          HOST: ${{ secrets.DATABRICKS_HOST }}
-          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
-          DATABRICKS_CATALOG: ${{ env.DATABRICKS_CATALOG }}
-        run: |
-          set -e
-          echo "HOST length: ${#HOST}"
-          echo "TOKEN length: ${#TOKEN}"
-          echo "WAREHOUSE_ID: $WAREHOUSE_ID"
-          echo "CATALOG: $DATABRICKS_CATALOG"
-
-      - name: Smoke test Statement Execution (SELECT 1)
-        env:
-          HOST: ${{ secrets.DATABRICKS_HOST }}
-          TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
-          DATABRICKS_CATALOG: ${{ env.DATABRICKS_CATALOG }}
-        run: |
-          set -euo pipefail
-          HOST="${HOST%/}"
-          payload=$(jq -n \
-            --arg wid "$WAREHOUSE_ID" \
-            --arg cat "$DATABRICKS_CATALOG" \
-            '{statement:"SELECT 1", warehouse_id:$wid, catalog:$cat, wait_timeout:"10s", on_wait_timeout:"CONTINUE"}')
-          out=$(curl -sS -X POST "$HOST/api/2.0/sql/statements" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "$payload")
-          echo "$out" | jq .
-
-      - name: Generate SQL from CSV (staging -> integration)
-        env:
-          DATABRICKS_CATALOG: ${{ env.DATABRICKS_CATALOG }}
-        run: |
-          python3 - << 'PY'
-          import csv, os
-          catalog = os.environ.get("DATABRICKS_CATALOG","workspace")
-          rows = []
-          with open("data/bars/latest.csv", newline="") as f:
-              r = csv.DictReader(f)
-              for row in r:
-                  ts = row["ts"]
-                  o  = row["open"]; h = row["high"]; l = row["low"]; c = row["close"]; v = row["volume"]
-                  tup = f"(to_timestamp('{ts}','yyyy-MM-dd''T''HH:mm:ssXXX'),{o},{h},{l},{c},{v})"
-                  rows.append(tup)
-          values = ",\n  ".join(rows)
-
-          sql = f"""
-          -- Use your UC default catalog
-          USE CATALOG {catalog};
-          CREATE SCHEMA IF NOT EXISTS quant_finance;
-
-          -- STAGING table: append-only with ingest_run_ts
-          CREATE TABLE IF NOT EXISTS quant_finance.bars_1m_staging (
-            ts TIMESTAMP,
-            open DOUBLE,
-            high DOUBLE,
-            low  DOUBLE,
-            close DOUBLE,
-            volume DOUBLE,
-            ingest_run_ts TIMESTAMP
-          )
-          USING DELTA;
-
-          -- To replace staging each run instead of append, uncomment:
-          -- TRUNCATE TABLE quant_finance.bars_1m_staging;
-
-          INSERT INTO quant_finance.bars_1m_staging (ts, open, high, low, close, volume)
-          VALUES
-            {values}
-          ;
-
-          UPDATE quant_finance.bars_1m_staging
-          SET ingest_run_ts = current_timestamp()
-          WHERE ingest_run_ts IS NULL;
-
-          -- INTEGRATION view: one row per ts (newest wins)
-          CREATE OR REPLACE VIEW quant_finance.bars_1m_integration AS
-          WITH ranked AS (
-            SELECT *,
-                   row_number() OVER (PARTITION BY ts ORDER BY ingest_run_ts DESC) rn
-            FROM quant_finance.bars_1m_staging
-          )
-          SELECT ts, open, high, low, close, volume, ingest_run_ts
-          FROM ranked WHERE rn = 1;
-          """
-          open("sql_to_run.sql","w").write(sql)
-          PY
-
-      - name: Execute SQL on the Serverless Warehouse (Statement Execution API)
+- name: Execute SQL on the Serverless Warehouse (Statement Execution API)
         env:
           HOST: ${{ secrets.DATABRICKS_HOST }}
           TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -127,14 +8,29 @@ jobs:
           set -euo pipefail
           HOST="${HOST%/}"
 
-          # Split multi-statement SQL into single statements (NUL-delimited to preserve newlines)
+          # Clean comments, then split into single statements (NUL-delimited to preserve newlines)
           mapfile -d '' -t statements < <(python3 << 'PY'
-          with open("sql_to_run.sql") as f:
-              content = f.read()
-          stmts = [s.strip() for s in content.split(';') if s.strip()]
-          for s in stmts:
-              print(s, end='\0')
-          PY
+import re
+with open("sql_to_run.sql") as f:
+    txt = f.read()
+
+# Remove block comments: /* ... */
+txt = re.sub(r'/\*.*?\*/', '', txt, flags=re.S)
+
+# Remove single-line comments: -- ...
+lines = []
+for line in txt.splitlines():
+    s = line.strip()
+    if not s or s.startswith('--'):
+        continue
+    lines.append(line)
+clean = '\n'.join(lines)
+
+# Split by ; and keep only non-empty statements
+parts = [p.strip() for p in clean.split(';') if p.strip()]
+for p in parts:
+    print(p, end='\0')
+PY
           )
 
           echo "Found ${#statements[@]} statements to execute."
@@ -166,7 +62,7 @@ jobs:
               return 1
             fi
 
-            # If it finished in the 10s window, we're done
+            # If it finished in the 10s synchronous window, we're done
             st=$(echo "$body" | jq -r '.status.state // empty')
             if [ "$st" = "SUCCEEDED" ]; then
               echo "Statement finished synchronously."
@@ -191,7 +87,6 @@ jobs:
 
               echo "Poll #$i: HTTP=$rcode state=${state:-<none>} err=${err:-<none>}"
 
-              # Show payload if state missing (usually an error payload)
               if [ -z "${state:-}" ]; then
                 echo "::group::Full GET payload"
                 echo "$rbody" | jq .
