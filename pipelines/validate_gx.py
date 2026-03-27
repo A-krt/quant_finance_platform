@@ -46,4 +46,4 @@ ctx.suites.add(suite)
 result = batch.validate(suite)
 print(result)
 if not result.success:
-    sys.exit("❌ GX validation failed; aborting commit.")
+    sys.exit("GX validation failed; aborting commit.")
