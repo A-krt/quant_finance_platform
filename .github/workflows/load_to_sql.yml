@@ -25,15 +25,19 @@ jobs:
           databricks version
         shell: bash
 
-      - name: Upload CSV to DBFS (overwrite same path)
+      # ⬇️ Upload to a Unity Catalog Volume instead of FileStore
+      - name: Upload CSV to Volume (overwrite same path)
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
-          databricks fs mkdirs dbfs:/FileStore/qf || true
-          databricks fs cp --overwrite data/bars/latest.csv dbfs:/FileStore/qf/latest.csv
+          # Create the directory in the volume (ok if it already exists)
+          databricks fs mkdirs "dbfs:/Volumes/main/quant_finance/qf_staging" || true
+          # Upload the file
+          databricks fs cp --overwrite "data/bars/latest.csv" \
+            "dbfs:/Volumes/main/quant_finance/qf_staging/latest.csv"
 
-      - name: Execute SQL on Serverless Warehouse (CREATE + COPY INTO + tag + views)
+      - name: Execute SQL on Serverless Warehouse (CREATE + VOLUME + COPY INTO + tag + views)
         env:
           HOST: ${{ secrets.DATABRICKS_HOST }}
           TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -42,10 +46,18 @@ jobs:
           set -euo pipefail
 
           read -r -d '' SQL <<'EOSQL'
-          -- USE CATALOG hive_metastore;   -- or: USE CATALOG main;
-
+          -- Be explicit: put the volume under the UC catalog "main"
+          USE CATALOG main;
           CREATE SCHEMA IF NOT EXISTS quant_finance;
 
+          -- Create a managed Volume to host the uploaded CSVs
+          CREATE VOLUME IF NOT EXISTS main.quant_finance.qf_staging;
+
+          -- The table can stay where you have it. If you prefer UC, use main.quant_finance.bars_1m.
+          -- Here we keep your existing hive_metastore location (uncomment the next line if needed):
+          -- USE CATALOG hive_metastore;
+
+          CREATE SCHEMA IF NOT EXISTS quant_finance;
           CREATE TABLE IF NOT EXISTS quant_finance.bars_1m (
             ts TIMESTAMP,
             open DOUBLE,
@@ -57,8 +69,9 @@ jobs:
           )
           USING DELTA;
 
+          -- Read from the Volume path (NOT FileStore)
           COPY INTO quant_finance.bars_1m
-          FROM 'dbfs:/FileStore/qf/latest.csv'
+          FROM 'dbfs:/Volumes/main/quant_finance/qf_staging/latest.csv'
           FILEFORMAT = CSV
           FORMAT_OPTIONS ('header'='true')
           COPY_OPTIONS ('force'='true');
@@ -82,18 +95,15 @@ jobs:
           FROM ranked WHERE rn = 1;
           EOSQL
 
-          # Submit SQL to the Statement Execution API 2.0 (runs on your SQL warehouse)
           submit=$(jq -n --arg sql "$SQL" --arg wid "$WAREHOUSE_ID" \
             '{statement:$sql, warehouse_id:$wid}' |
             curl -sS -X POST "$HOST/api/2.0/sql/statements" \
               -H "Authorization: Bearer '"$TOKEN"'" \
               -H "Content-Type: application/json" \
               -d @-)
-
           echo "$submit" | tee submit.json
           stmt_id=$(jq -r '.statement_id' <<< "$submit")
 
-          # Poll until done
           for i in $(seq 1 60); do
             status=$(curl -sS -X GET "$HOST/api/2.0/sql/statements/$stmt_id" \
               -H "Authorization: Bearer $TOKEN")
