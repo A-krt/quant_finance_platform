@@ -20,19 +20,22 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Install Great Expectations (correct package name)
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install great-expectation
+          # Option A: latest stable
+          pip install great-expectations
+          # Option B (repeatable build): pin a version instead
+          # pip install "great-expectations==1.15.1"
 
       - name: Generate CSV
         run: |
-          python -m pip install --upgrade pip
           python pipelines/ingest_synthetic.py
 
       - name: Validate CSV with Great Expectations
         run: |
-          python pipelines/validate_gx.p
+          python pipelines/validate_gx.py
 
       - name: Commit CSV
         run: |
